@@ -119,17 +119,17 @@ def bootstrap_func(compute_index_func: Callable, **kwargs) -> xr.DataArray:
         )
     # Boundary years of reference period
     clim = per_da.attrs["climatology_bounds"]
-    if xclim.core.utils.uses_dask(da) and len(da.chunks[da.get_axis_num("time")]) > 1:
-        warnings.warn(
-            "The input data is chunked on time dimension and must be fully re-chunked to"
-            " run percentile bootstrapping."
-            " Beware, this operation can significantly increase the number of tasks dask"
-            " has to handle.",
-            stacklevel=2,
-        )
-        chunking = {d: "auto" for d in da.dims}
-        chunking["time"] = -1  # no chunking on time to use map_block
-        da = da.chunk(chunking)
+    # if xclim.core.utils.uses_dask(da) and len(da.chunks[da.get_axis_num("time")]) > 1:
+    #     warnings.warn(
+    #         "The input data is chunked on time dimension and must be fully re-chunked to"
+    #         " run percentile bootstrapping."
+    #         " Beware, this operation can significantly increase the number of tasks dask"
+    #         " has to handle.",
+    #         stacklevel=2,
+    #     )
+    #     chunking = {d: "auto" for d in da.dims}
+    #     chunking["time"] = -1  # no chunking on time to use map_block
+    #     da = da.chunk(chunking)
     # overlap of studied `da` and reference period used to compute percentile
     overlap_da = da.sel(time=slice(*clim))
     if len(overlap_da.time) == len(da.time):
@@ -152,7 +152,7 @@ def bootstrap_func(compute_index_func: Callable, **kwargs) -> xr.DataArray:
     # Group input array in years, with an offset matching freq
     overlap_years_groups = overlap_da.resample(time=bfreq).groups
     da_years_groups = da.resample(time=bfreq).groups
-    per_template = per_da.copy(deep=True)
+    # per_template = per_da.copy(deep=True)
     acc = []
     # Compute bootstrapped index on each year of overlapping years
     for year_key, year_slice in da_years_groups.items():
@@ -160,26 +160,28 @@ def bootstrap_func(compute_index_func: Callable, **kwargs) -> xr.DataArray:
         if _get_year_label(year_key) in overlap_da.get_index("time").year:
             # If the group year is in both reference and studied periods, run the bootstrap
             bda = build_bootstrap_year_da(overlap_da, overlap_years_groups, year_key)
-            if BOOTSTRAP_DIM not in per_template.dims:
-                per_template = per_template.expand_dims(
-                    {BOOTSTRAP_DIM: np.arange(len(bda._bootstrap))}
-                )
-                if xclim.core.utils.uses_dask(bda):
-                    chunking = {
-                        d: bda.chunks[bda.get_axis_num(d)]
-                        for d in set(bda.dims).intersection(set(per_template.dims))
-                    }
-                    per_template = per_template.chunk(chunking)
-            per = xr.map_blocks(
-                percentile_doy.__wrapped__,  # strip history update from percentile_doy
-                obj=bda,
-                kwargs={**pdoy_args, "copy": False},
-                template=per_template,
-            )
+            # if BOOTSTRAP_DIM not in per_template.dims:
+            #     per_template = per_template.expand_dims(
+            #         {BOOTSTRAP_DIM: np.arange(len(bda._bootstrap))}
+            #     )
+            #     if xclim.core.utils.uses_dask(bda):
+            #         chunking = {
+            #             d: bda.chunks[bda.get_axis_num(d)]
+            #             for d in set(bda.dims).intersection(set(per_template.dims))
+            #         }
+            #         per_template = per_template.chunk(chunking)
+            # per = xr.map_blocks(
+            #     percentile_doy.__wrapped__,  # strip history update from percentile_doy
+            #     obj=bda,
+            #     kwargs={**pdoy_args, "copy": False},
+            #     template=per_template,
+            # )
+            per = percentile_doy(bda, **pdoy_args, copy=False)
             if "percentiles" not in per_da.dims:
                 per = per.squeeze("percentiles")
             kw[per_key] = per
             value = compute_index_func(**kw).mean(dim=BOOTSTRAP_DIM, keep_attrs=True)
+            value.compute()
         else:
             # Otherwise, run the normal computation using the original percentile
             kw[per_key] = per_da
