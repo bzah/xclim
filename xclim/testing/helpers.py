@@ -228,7 +228,7 @@ def test_timeseries(
     freq="D",
     as_dataset=False,
     cftime=False,
-):
+) -> xr.Dataset | xr.DataArray:
     """Create a generic timeseries object based on pre-defined dictionaries of existing variables."""
     if cftime:
         coords = xr.cftime_range(start, periods=len(values), freq=freq)

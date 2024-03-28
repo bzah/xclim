@@ -1,7 +1,9 @@
 from __future__ import annotations
+from collections.abc import Callable
 
 import numpy as np
 import pytest
+import xarray
 
 from xclim.core.calendar import percentile_doy
 from xclim.indices import (
@@ -23,7 +25,7 @@ class Test_bootstrap:
     @pytest.mark.slow
     @pytest.mark.parametrize("use_dask", [True, False])
     @pytest.mark.parametrize(
-        "var,p,index,freq, cftime",
+        "var,per,index,freq, cftime",
         (
             ["tas", 98, tg90p, "MS", False],
             ["tasmin", 98, tn90p, "YS-JUL", False],
@@ -40,27 +42,29 @@ class Test_bootstrap:
             ["pr", 98, fraction_over_precip_thresh, "MS", True],
         ),
     )
-    def test_bootstrap(self, var, p, index, freq, cftime, use_dask, random):
+    def test_bootstrap(self, var: str, per:int, index: Callable[..., xarray.DataArray], freq:str, cftime:bool, use_dask: bool, random: Callable):
         # -- GIVEN
         arr = self.ar1(
             alpha=0.8, n=int(4 * 365.25), random=random, positive_values=(var == "pr")
         )
-        climate_var = _test_timeseries(
-            arr, start="2000-01-01", variable=var, cftime=cftime
+        climate_var: xarray.DataArray = _test_timeseries(
+            arr, start="2000-01-01", variable=var, cftime=cftime, as_dataset=False
         )
         if use_dask:
             climate_var = climate_var.chunk(dict(time=50))
         in_base_slice = slice("2000-01-01", "2001-12-31")
         out_base_slice = slice("2002-01-01", "2003-12-31")
-        per = percentile_doy(climate_var.sel(time=in_base_slice), per=p)
+        per_doy = percentile_doy(climate_var.sel(time=in_base_slice), per=per)
 
         # -- WHEN
-        no_bootstrap = index(climate_var, per, freq=freq, bootstrap=False)
+        no_bootstrap = index(climate_var, per_doy, freq=freq, bootstrap=False)
         no_bs_in_base = no_bootstrap.sel(time=in_base_slice)
         no_bs_out_base = no_bootstrap.sel(time=out_base_slice)
-        bootstrap = index(climate_var, per, freq=freq, bootstrap=True)
+        bootstrap = index(climate_var, per_doy, freq=freq, bootstrap=True)
         bootstrapped_in_base = bootstrap.sel(time=in_base_slice)
         bs_out_base = bootstrap.sel(time=out_base_slice)
+
+        breakpoint()
 
         # -- THEN
         # Bootstrapping should increase the computed index values within the overlapping

@@ -1,10 +1,8 @@
 """Module comprising the bootstrapping algorithm for indicators."""
 
 from __future__ import annotations
-
-import warnings
 from inspect import signature
-from typing import Any, Callable
+from typing import Any, Callable, Generator
 
 import cftime
 import numpy as np
@@ -12,6 +10,7 @@ import xarray
 from boltons.funcutils import wraps
 from xarray.core.dataarray import DataArray
 
+import pandas as pd
 import xclim.core.utils
 
 from .calendar import convert_calendar, parse_offset, percentile_doy
@@ -65,7 +64,9 @@ def percentile_bootstrap(func):
     return wrapper
 
 
-def bootstrap_func(compute_index_func: Callable, **kwargs) -> xarray.DataArray:
+def bootstrap_func(
+    compute_index_func: Callable[[], DataArray], **index_kwargs
+) -> DataArray:
     r"""Bootstrap the computation of percentile-based indices.
 
     Indices measuring exceedance over percentile-based thresholds (such as tx90p) may contain artificial discontinuities
@@ -114,15 +115,19 @@ def bootstrap_func(compute_index_func: Callable, **kwargs) -> xarray.DataArray:
     """
     # Identify the input and the percentile arrays from the bound arguments
     per_key = None
-    for name, val in kwargs.items():
+    da_key = None
+    for name, val in index_kwargs.items():
         if isinstance(val, DataArray):
             if "percentile_doy" in val.attrs.get("history", ""):
                 per_key = name
             else:
                 da_key = name
+    if da_key is None or per_key is None:
+        msg = "bootstrap decorator can only be applied to indices with 2 Dataarrays."
+        raise NotImplementedError(msg)
     # Extract the DataArray inputs from the arguments
-    da: DataArray = kwargs.pop(da_key)
-    per_da: DataArray | None = kwargs.pop(per_key, None)
+    da: DataArray = index_kwargs.pop(da_key)
+    per_da: DataArray | None = index_kwargs.pop(per_key, None)
     if per_da is None:
         # per may be empty on non doy percentiles
         raise KeyError(
@@ -130,74 +135,169 @@ def bootstrap_func(compute_index_func: Callable, **kwargs) -> xarray.DataArray:
         )
     # Boundary years of reference period
     clim = per_da.attrs["climatology_bounds"]
-    if xclim.core.utils.uses_dask(da) and len(da.chunks[da.get_axis_num("time")]) > 1:
-        warnings.warn(
-            "The input data is chunked on time dimension and must be fully re-chunked to"
-            " run percentile bootstrapping."
-            " Beware, this operation can significantly increase the number of tasks dask"
-            " has to handle.",
-            stacklevel=2,
-        )
-        chunking = {d: "auto" for d in da.dims}
-        chunking["time"] = -1  # no chunking on time to use map_block
-        da = da.chunk(chunking)
     # overlap of studied `da` and reference period used to compute percentile
     overlap_da = da.sel(time=slice(*clim))
     if len(overlap_da.time) == len(da.time):
         raise KeyError(
             "`bootstrap` is unnecessary when all years are overlapping between reference "
-            "(percentiles period) and studied (index period) periods"
+            "(percentiles period) and studied (index period) periods."
         )
     if len(overlap_da) == 0:
         raise KeyError(
-            "`bootstrap` is unnecessary when no year overlap between reference "
-            "(percentiles period) and studied (index period) periods."
+            "`bootstrap` is unnecessary when no year are overlapping between the reference "
+            "(percentiles period) and the studied (index period) periods."
         )
-    pdoy_args = dict(
-        window=per_da.attrs["window"],
-        alpha=per_da.attrs["alpha"],
-        beta=per_da.attrs["beta"],
-        per=per_da.percentiles.data[()],
-    )
-    bfreq = _get_bootstrap_freq(kwargs["freq"])
+    per_window = per_da.attrs["window"]
+    per_alpha = per_da.attrs["alpha"]
+    per_beta = per_da.attrs["beta"]
+    per_per = per_da.percentiles.data[()]
+    bfreq = _get_bootstrap_freq(index_kwargs["freq"])
     # Group input array in years, with an offset matching freq
+    # TODO: Use `overlap_years_groups` instead of `in_base_years` to generalize for freq != YS
     overlap_years_groups = overlap_da.resample(time=bfreq).groups
     da_years_groups = da.resample(time=bfreq).groups
     per_template = per_da.copy(deep=True)
-    acc = []
+    exceedances = []
     # Compute bootstrapped index on each year of overlapping years
-    for year_key, year_slice in da_years_groups.items():
-        kw = {da_key: da.isel(time=year_slice), **kwargs}
-        if _get_year_label(year_key) in overlap_da.get_index("time").year:
-            # If the group year is in both reference and studied periods, run the bootstrap
-            bda = build_bootstrap_year_da(overlap_da, overlap_years_groups, year_key)
-            if BOOTSTRAP_DIM not in per_template.dims:
-                per_template = per_template.expand_dims(
-                    {BOOTSTRAP_DIM: np.arange(len(bda._bootstrap))}
-                )
-                if xclim.core.utils.uses_dask(bda):
-                    chunking = {
-                        d: bda.chunks[bda.get_axis_num(d)]
-                        for d in set(bda.dims).intersection(set(per_template.dims))
-                    }
-                    per_template = per_template.chunk(chunking)
-            per = xarray.map_blocks(
-                percentile_doy.__wrapped__,  # strip history update from percentile_doy
-                obj=bda,
-                kwargs={**pdoy_args, "copy": False},
-                template=per_template,
+
+    ##################
+    #  Attempt start #
+    ##################
+    # -- Compute index before in_base
+    in_base_years = [_get_year_label(y) for y in overlap_years_groups.keys() ]
+    # -- Compute index before in_base
+    inbase_first_year = min(in_base_years)
+    before_inbase_first_year = da.get_index("time").year[-1]
+    if before_inbase_first_year < inbase_first_year  :
+        # -- There are years before in_base, compute the index normally on them
+        before_in_base_slice = slice(before_inbase_first_year, inbase_first_year -1)
+        index_kwargs[da_key] = da.sel(time=before_in_base_slice)
+        index_kwargs[per_key] = per_da
+        before_inbase_exceedance = compute_index_func(**index_kwargs)
+        exceedances.append(before_inbase_exceedance)
+
+    crd = xarray.Coordinates.from_pandas_multiindex(
+        pd.MultiIndex.from_arrays(
+            (overlap_da.time.dt.year.values, overlap_da.time.dt.dayofyear.values),
+            names=("year", "dayofyear"),
+        ),
+        "time",
+    )
+    windowed_data = (
+        overlap_da
+        .assign_coords(crd)
+        .unstack("time")
+        .rolling(min_periods=1, center=True, dayofyear=per_window)
+        .construct("window")
+    )
+    index_kwargs[da_key] = overlap_da
+    # TODO: make sure it can fit in memory or that dask is clever enough to not persist it if it does n.
+    windowed_data.persist()  # persist `windowed_data` as we reuse it many times
+    sorted_stacked_wo_replaced_year = None
+    # TODO: use overlap_years_groups instead, in case the freq is 10YS or YS-JUNE
+    for year_to_be_replaced in in_base_years:
+        # loop over the "30" years of in_base
+        # pop year_to_be_replaced
+        windowed_data_without_year_to_be_replaced = windowed_data.where(
+            windowed_data.time.dt.year == year_to_be_replaced, drop=True
+        )
+        # replaced_year = data.pop(year_to_be_replaced)
+        stacked_wo_replaced_year = windowed_data_without_year_to_be_replaced.stack(stacked_dim=("window", "year"))
+        # `stacked` dim is at the end of of stacked_data (which is actually better for sort)
+        # TODO: use map_block to avoid putting the whole array in memory with sort ?
+        #       (perhaps it's actually better to have it in mem, if it fits)
+        # TODO 2: See if we can use topk instead of sort.
+        #         This might reduce greatly the memory cost.
+        #         In which case, we would need to rewrite calc_perc to
+        #         select the left and right bounds from the subsample (the topk appended to the replacing_year)
+        #         and compute the interpolation ourselves.
+        sorted_stacked_wo_replaced_year = np.sort(stacked_wo_replaced_year.data, axis=-1)
+        summed_exceedance: DataArray | None = None
+        replacing_years = (windowed_data_without_year_to_be_replaced.sel(year=y).stack(stacked=("window", "year")).data
+                           for y in in_base_years
+                           if y != year_to_be_replaced)
+        for replacing_year_data in replacing_years:
+            # loop over the "29" other years and compute exceedance
+            sorted_stacked_rebuilt_in_base = np.sort(
+                np.append(sorted_stacked_wo_replaced_year, replacing_year_data),
+                axis=-1,
+                kind="mergesort",
             )
-            if "percentiles" not in per_da.dims:
-                per = per.squeeze("percentiles")
-            kw[per_key] = per
-            value = compute_index_func(**kw).mean(dim=BOOTSTRAP_DIM, keep_attrs=True)
-        else:
-            # Otherwise, run the normal computation using the original percentile
-            kw[per_key] = per_da
-            value = compute_index_func(**kw)
-        acc.append(value)
-    result = xarray.concat(acc, dim="time")
-    result.attrs["units"] = value.attrs["units"]
+            per_doy = xclim.core.utils.calc_perc(
+                sorted_stacked_rebuilt_in_base,
+                alpha=per_alpha,
+                beta=per_beta,
+                percentiles=per_per,
+                copy=False,
+                pre_sorted=True
+            )
+            index_kwargs[per_key] = per_doy
+            if summed_exceedance is None:
+                summed_exceedance = compute_index_func(**index_kwargs)
+            else:
+                summed_exceedance += compute_index_func(**index_kwargs)
+        if summed_exceedance is None:
+            err = "No year were bootstrapped."
+            raise NotImplementedError(err)
+        averaged_in_base_exceedance = summed_exceedance / (len(in_base_years) - 1)
+        exceedances.append(averaged_in_base_exceedance)
+    # -- Compute index after in_base
+    in_base_last_year = np.max(in_base_years)
+    after_base_last_year = da.time.isel(time=-1).time.dt.year
+    if after_base_last_year > in_base_last_year :
+        # -- There are years after in_base, compute the index normally on them
+        after_in_base_slice = slice(in_base_last_year + 1, after_base_last_year)
+        index_kwargs[per_key] = per_da
+        index_kwargs[da_key] = da.sel(time=after_in_base_slice)
+        after_inbase_exceedance = compute_index_func(**index_kwargs)
+        exceedances.append(after_inbase_exceedance)
+    # -- Aggregate results
+    result = xarray.concat(exceedances, dim="time")
+    result.attrs["units"] = exceedances[0].attrs["units"]
+
+    ##################
+    #   Attempt end  #
+    ##################
+
+    # value = []
+    # for year_key, year_slice in da_years_groups.items():
+    #     # 30 years
+    #     kw = {da_key: da.isel(time=year_slice), **index_kwargs}
+    #     if _get_year_label(year_key) in overlap_da.get_index("time").year:
+    #         # If the group year is in both reference and studied periods, run the bootstrap
+    #         exceedances = []
+    #
+    #         # TODO: optimize here ?
+    #         # Cherry-picking from percentile_doy, we could pre-build `rolled_overlap_da` (lat, lon, doy, window_year)
+    #         # dataset.
+    #         # Then we create `sorted_overlap_da` by sorting on window_year
+    #         # Then we build `rolled_bda`: the (lat, lon, doy, window) of the year to add to the dataset (year_slice).
+    #         # Then we only need to concat the `rolled_bda` with `sorted_overlap_da` (would replace `build_bootstrap_year_da`).
+    #         # run cal_perc on `concated_da` with apply_ufunc.
+    #
+    #         for bda_year in build_bootstrap_year_da(
+    #             overlap_da, overlap_years_groups, year_key
+    #         ):
+    #             # 30 years
+    #             per = percentile_doy(
+    #                 bda_year,
+    #                 window=per_window,
+    #                 alpha=per_alpha,
+    #                 beta=per_beta,
+    #                 per=per_per,
+    #             )
+    #             kw[per_key] = per
+    #             exceedances.append(compute_index_func(**kw))
+    #         value = xarray.concat(exceedances, dim=BOOTSTRAP_DIM).mean(
+    #             dim=BOOTSTRAP_DIM, keep_attrs=True
+    #         )
+    #     else:
+    #         # Otherwise, run the normal computation using the original percentile
+    #         kw[per_key] = per_da
+    #         value = compute_index_func(**kw)
+    #     value.append(value)
+    # result = xarray.concat(value, dim="time")
+    # result.attrs["units"] = value.attrs["units"]
     return result
 
 
@@ -213,7 +313,7 @@ def _get_bootstrap_freq(freq):
     return bfreq
 
 
-def _get_year_label(year_dt) -> str:
+def _get_year_label(year_dt: cftime.datetime | np.datetime64) -> str:
     if isinstance(year_dt, cftime.datetime):
         year_label = year_dt.year
     else:
@@ -224,7 +324,7 @@ def _get_year_label(year_dt) -> str:
 # TODO: Return a generator instead and assess performance
 def build_bootstrap_year_da(
     da: DataArray, groups: dict[Any, slice], label: Any, dim: str = "time"
-) -> DataArray:
+) -> Generator[DataArray]:
     """Return an array where a group in the original is replaced by every other groups along a new dimension.
 
     Parameters
@@ -240,7 +340,7 @@ def build_bootstrap_year_da(
 
     Returns
     -------
-    DataArray:
+    Generator[DataArray]:
       Array where one group is replaced by values from every other group along the `bootstrap` dimension.
     """
     gr = groups.copy()
@@ -248,8 +348,6 @@ def build_bootstrap_year_da(
     bloc = da[dim][gr.pop(label)]
     # Initialize output array with new bootstrap dimension
     out = da.expand_dims({BOOTSTRAP_DIM: np.arange(len(gr))}).copy(deep=True)
-    # With dask, mutating the views of out is not working, thus the accumulator
-    out_accumulator = []
     # Replace `bloc` by every other group
     for i, (_, group_slice) in enumerate(gr.items()):
         source = da.isel({dim: group_slice})
@@ -271,5 +369,4 @@ def build_bootstrap_year_da(
             out_view.loc[{dim: bloc}] = source.data[: len(bloc)]
         else:
             raise NotImplementedError
-        out_accumulator.append(out_view)
-    return xarray.concat(out_accumulator, dim=BOOTSTRAP_DIM)
+        yield out_view

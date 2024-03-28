@@ -297,7 +297,8 @@ def uas_vas_2_sfcwind(
 
 @declare_units(sfcWind="[speed]", sfcWindfromdir="[]")
 def sfcwind_2_uas_vas(
-    sfcWind: xr.DataArray, sfcWindfromdir: xr.DataArray  # noqa
+    sfcWind: xr.DataArray,
+    sfcWindfromdir: xr.DataArray,  # noqa
 ) -> tuple[xr.DataArray, xr.DataArray]:
     """Eastward and northward wind components from the wind speed and direction.
 

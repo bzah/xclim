@@ -109,7 +109,10 @@ def wrapped_partial(func: Callable, suggested: dict | None = None, **fixed) -> C
     partial_func = partial(func, **suggested, **fixed)
 
     fully_wrapped = update_wrapper(
-        partial_func, func, injected=list(fixed.keys()), hide_wrapped=True  # noqa
+        partial_func,
+        func,
+        injected=list(fixed.keys()),
+        hide_wrapped=True,  # noqa
     )
 
     # Store all injected params,
@@ -305,10 +308,11 @@ def uses_dask(*das: xr.DataArray | xr.Dataset) -> bool:
 
 def calc_perc(
     arr: np.ndarray,
-    percentiles: Sequence[float] = None,
+    percentiles: Sequence[float] | None = None,
     alpha: float = 1.0,
     beta: float = 1.0,
     copy: bool = True,
+    pre_sorted: bool = False,
 ) -> np.ndarray:
     """Compute percentiles using nan_calc_percentiles and move the percentiles' axis to the end."""
     if percentiles is None:
@@ -316,7 +320,13 @@ def calc_perc(
 
     return np.moveaxis(
         nan_calc_percentiles(
-            arr=arr, percentiles=percentiles, axis=-1, alpha=alpha, beta=beta, copy=copy
+            arr=arr,
+            percentiles=percentiles,
+            axis=-1,
+            alpha=alpha,
+            beta=beta,
+            copy=copy,
+            pre_sorted=pre_sorted,
         ),
         source=0,
         destination=-1,
@@ -330,6 +340,7 @@ def nan_calc_percentiles(
     alpha: float = 1.0,
     beta: float = 1.0,
     copy: bool = True,
+    pre_sorted: bool = False,
 ) -> np.ndarray:
     """Convert the percentiles to quantiles and compute them using _nan_quantile."""
     if percentiles is None:
@@ -340,7 +351,7 @@ def nan_calc_percentiles(
         # doing it again is extremely costly, especially with dask.
         arr = arr.copy()
     quantiles = np.array([per / 100.0 for per in percentiles])
-    return _nan_quantile(arr, quantiles, axis, alpha, beta)
+    return _nan_quantile(arr, quantiles, axis, alpha, beta, pre_sorted)
 
 
 def _compute_virtual_index(
@@ -469,6 +480,7 @@ def _nan_quantile(
     axis: int = 0,
     alpha: float = 1.0,
     beta: float = 1.0,
+    pre_sorted: bool = False,
 ) -> float | np.ndarray:
     """Get the quantiles of the array for the given axis.
 
@@ -508,7 +520,8 @@ def _nan_quantile(
         arr, virtual_indexes, valid_values_count
     )
     # --- Sorting
-    arr.sort(axis=DATA_AXIS)
+    if not pre_sorted:
+        arr.sort(axis=DATA_AXIS)
     # --- Get values from indexes
     arr = arr[..., np.newaxis]
     previous = np.squeeze(
@@ -808,9 +821,9 @@ def adapt_clix_meta_yaml(  # noqa: C901
                             ),
                             "units": param["units"],
                         }
-                        rename_params[f"{{{name}}}"] = (
-                            f"{{{list(param['data'].keys())[0]}}}"
-                        )
+                        rename_params[
+                            f"{{{name}}}"
+                        ] = f"{{{list(param['data'].keys())[0]}}}"
                     else:
                         # Value
                         data["parameters"][name] = f"{param['data']} {param['units']}"
