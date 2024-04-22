@@ -524,7 +524,7 @@ def _nan_quantile(
         arr.sort(axis=DATA_AXIS)
     # --- Get values from indexes
     arr = arr[..., np.newaxis]
-    previous = np.squeeze(
+    previous_elements = np.squeeze(
         np.take_along_axis(arr, previous_indexes.astype(int)[np.newaxis, ...], axis=0),
         axis=0,
     )
@@ -534,7 +534,7 @@ def _nan_quantile(
     )
     # --- Linear interpolation
     gamma = _get_gamma(virtual_indexes, previous_indexes)
-    interpolation = _linear_interpolation(previous, next_elements, gamma)
+    interpolation = _linear_interpolation(previous_elements, next_elements, gamma)
     # When an interpolation is in Nan range, (near the end of the sorted array) it means
     # we can clip to the array max value.
     result = np.where(np.isnan(interpolation), np.nanmax(arr, axis=0), interpolation)

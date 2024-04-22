@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from inspect import signature
+from math import ceil, floor
 from typing import Any, Callable, Generator
 
 import cftime
@@ -13,7 +14,7 @@ from xarray.core.dataarray import DataArray
 import pandas as pd
 import xclim.core.utils
 
-from .calendar import convert_calendar, parse_offset, percentile_doy
+from .calendar import convert_calendar, parse_offset
 
 BOOTSTRAP_DIM = "_bootstrap"
 
@@ -162,6 +163,7 @@ def bootstrap_func(
 
     ##################
     #  Attempt start #
+    #    One sort    #
     ##################
     # -- Compute index before in_base
     in_base_years = [_get_year_label(y) for y in overlap_years_groups.keys() ]
@@ -299,6 +301,130 @@ def bootstrap_func(
     # result = xarray.concat(value, dim="time")
     # result.attrs["units"] = value.attrs["units"]
     return result
+
+from  dask.array.core import Array
+def distributed_percentile(arr: Array, per: int, axis:int):
+    """
+    Parameters
+    ----------
+    arr: dask.Array
+    per: int
+        Percentile value. Must be between 0 and 99.
+    axis: int
+        Axis where the computation is performed.
+    """
+    import dask
+    # Monkey patch dask chunk's topk to use our nan handling topk
+    dask.array.chunk.topk = nan_topk
+    quantile = per/100
+    # Ideal because some chunks may have Nan, so the number of values below per will be lower
+    ideal_number_of_value_below_per = arr.size * quantile
+    ideal_number_of_value_below_per_ceil = ceil(ideal_number_of_value_below_per)
+    ideal_number_of_value_below_per_floor = floor(ideal_number_of_value_below_per)
+    top_per_percent = arr.topk(k = ideal_number_of_value_below_per_ceil, axis=axis)
+    if has_no_nans(arr):
+        if ideal_number_of_value_below_per_ceil == ideal_number_of_value_below_per_floor:
+            # No need to interpolate, return smallest value of the top per percent values
+            return top_per_percent[-1]
+        else:
+            result = linear_interpolation(top_per_percent[-1], top_per_percent[-2])
+    else:
+        # has nans
+        sample_sizes = get_no_nans_sample_sizes()
+        virtual_indexes = _compute_virtual_index(n = sample_sizes, quantiles=quantile, alpha=1/3, beta=1/3)
+        previous_indexes, next_indexes = _get_indexes(
+        arr, virtual_indexes, valid_values_count=ideal_number_of_value_below_per_ceil
+        )
+        # Same shape array but for the first axis which is one value (will be filled with the percentile)
+        result = arr[1,...]
+        # TODO: make sure this is performant enough
+        #       There is no take_along_axis on dask so we need an alternative
+        previouses = top_per_percent.ravel()[previous_indexes.ravel()].reshape(previous_indexes)
+        nextes = top_per_percent.ravel()[next_indexes.ravel()].reshape(next_indexes)
+
+        for i, (b,a) in enumerate(zip(previous_indexes, next_indexes)):
+            result[i] = linear_interpolation(top_per_percent[i,-b], top_per_percent[i,-a])
+
+
+
+def _compute_virtual_index(
+    n: np.ndarray, quantiles: np.ndarray | float, alpha: float, beta: float
+):
+    """Compute the floating point indexes of an array for the linear interpolation of quantiles.
+
+    Based on the approach used by :cite:t:`hyndman_sample_1996`.
+
+    Parameters
+    ----------
+    n : array_like
+        The sample sizes.
+    quantiles : array_like | float
+        The quantiles values.
+    alpha : float
+        A constant used to correct the index computed.
+    beta : float
+        A constant used to correct the index computed.
+
+    Notes
+    -----
+    `alpha` and `beta` values depend on the chosen method (see quantile documentation).
+
+    References
+    ----------
+    :cite:cts:`hyndman_sample_1996`
+    """
+    return n * quantiles + (alpha + quantiles * (1 - alpha - beta)) - 1
+
+def linear_interpolation(arr1, arr2, alpha: float = 1.0, beta: float = 1.0):
+    pass
+
+
+def nan_topk(a, k, axis, keepdims):
+    """Compute topk on a chunk while ignoring nans.
+
+    TODO: To upstream to Dask
+    """
+    assert keepdims is True
+    axis = axis[0]
+    if abs(k) >= a.shape[axis]:
+        return a
+    max_nan_count = np.isnan(a).sum(axis=axis).max()
+    if max_nan_count != 0:
+        a = np.partition(a, -(k + max_nan_count), axis=axis)
+        a = a[~np.isnan(a)]
+    else:
+        a = np.partition(a, -k, axis=axis)
+    k_slice = slice(-k, None) if k > 0 else slice(-k)
+    return a[tuple(k_slice if i == axis else slice(None) for i in range(a.ndim))]
+
+def nan_argtopk(a_plus_idx, k, axis, keepdims):
+    """Compute argtopk on a chunk while ignoring nans.
+
+    TODO: To upstream to Dask
+    """
+    from dask.core import flatten
+    assert keepdims is True
+    axis = axis[0]
+    if isinstance(a_plus_idx, list):
+        a_plus_idx = list(flatten(a_plus_idx))
+        a = np.concatenate([ai for ai, _ in a_plus_idx], axis)
+        idx = np.concatenate(
+            [np.broadcast_to(idxi, ai.shape) for ai, idxi in a_plus_idx], axis
+        )
+    else:
+        a, idx = a_plus_idx
+    if abs(k) >= a.shape[axis]:
+        return a_plus_idx
+    max_nan_count = np.isnan(a).sum(axis=axis).max()
+    if max_nan_count != 0:
+        idx2 = np.argpartition(a, -(k + max_nan_count), axis=axis)
+        mask = np.isnan(a[idx2])
+        idx2 = idx2[~mask]
+    else:
+        idx2 = np.argpartition(a, -k, axis=axis)
+    k_slice = slice(-k, None) if k > 0 else slice(-k)
+    idx2 = idx2[tuple(k_slice if i == axis else slice(None) for i in range(a.ndim))]
+    return np.take_along_axis(a, idx2, axis), np.take_along_axis(idx, idx2, axis)
 
 
 def _get_bootstrap_freq(freq):
