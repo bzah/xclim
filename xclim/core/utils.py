@@ -312,7 +312,6 @@ def calc_perc(
     alpha: float = 1.0,
     beta: float = 1.0,
     copy: bool = True,
-    pre_sorted: bool = False,
 ) -> np.ndarray:
     """Compute percentiles using nan_calc_percentiles and move the percentiles' axis to the end."""
     if percentiles is None:
@@ -326,7 +325,6 @@ def calc_perc(
             alpha=alpha,
             beta=beta,
             copy=copy,
-            pre_sorted=pre_sorted,
         ),
         source=0,
         destination=-1,
@@ -340,7 +338,6 @@ def nan_calc_percentiles(
     alpha: float = 1.0,
     beta: float = 1.0,
     copy: bool = True,
-    pre_sorted: bool = False,
 ) -> np.ndarray:
     """Convert the percentiles to quantiles and compute them using _nan_quantile."""
     if percentiles is None:
@@ -351,7 +348,7 @@ def nan_calc_percentiles(
         # doing it again is extremely costly, especially with dask.
         arr = arr.copy()
     quantiles = np.array([per / 100.0 for per in percentiles])
-    return _nan_quantile(arr, quantiles, axis, alpha, beta, pre_sorted)
+    return _nan_quantile(arr, quantiles, axis, alpha, beta )
 
 
 def _compute_virtual_index(
@@ -480,7 +477,6 @@ def _nan_quantile(
     axis: int = 0,
     alpha: float = 1.0,
     beta: float = 1.0,
-    pre_sorted: bool = False,
 ) -> float | np.ndarray:
     """Get the quantiles of the array for the given axis.
 
@@ -520,8 +516,7 @@ def _nan_quantile(
         arr, virtual_indexes, valid_values_count
     )
     # --- Sorting
-    if not pre_sorted:
-        arr.sort(axis=DATA_AXIS)
+    arr.sort(axis=DATA_AXIS)
     # --- Get values from indexes
     arr = arr[..., np.newaxis]
     previous_elements = np.squeeze(

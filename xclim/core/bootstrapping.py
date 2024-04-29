@@ -7,12 +7,13 @@ from typing import Any, Callable, Generator
 
 import cftime
 import numpy as np
+from numpy.core.multiarray import ndarray
 import xarray
+from dask.array.core import Array
 from boltons.funcutils import wraps
 from xarray.core.dataarray import DataArray
 
 import pandas as pd
-import xclim.core.utils
 
 from .calendar import convert_calendar, parse_offset
 
@@ -115,6 +116,7 @@ def bootstrap_func(
 
     """
     # Identify the input and the percentile arrays from the bound arguments
+    import xclim.core.utils
     per_key = None
     da_key = None
     for name, val in index_kwargs.items():
@@ -302,8 +304,7 @@ def bootstrap_func(
     # result.attrs["units"] = value.attrs["units"]
     return result
 
-from  dask.array.core import Array
-def distributed_percentile(arr: Array, per: int, axis:int):
+def distributed_percentile(arr: Array, per: int, axis:int, alpha: float = 1/3, beta: float=1/3):
     """
     Parameters
     ----------
@@ -313,44 +314,215 @@ def distributed_percentile(arr: Array, per: int, axis:int):
     axis: int
         Axis where the computation is performed.
     """
+    # #### Monkey patch dask chunk's topk to use our nan handling topk
     import dask
-    # Monkey patch dask chunk's topk to use our nan handling topk
     dask.array.chunk.topk = nan_topk
+    # #### Monkey patch end.
     quantile = per/100
-    # Ideal because some chunks may have Nan, so the number of values below per will be lower
-    ideal_number_of_value_below_per = arr.size * quantile
+    # Ideal because some chunks may have Nan, so the number of values below per will be lower for these chunks.
+    ideal_number_of_value_below_per =  arr.shape[axis] * quantile
     ideal_number_of_value_below_per_ceil = ceil(ideal_number_of_value_below_per)
     ideal_number_of_value_below_per_floor = floor(ideal_number_of_value_below_per)
-    top_per_percent = arr.topk(k = ideal_number_of_value_below_per_ceil, axis=axis)
-    if has_no_nans(arr):
-        if ideal_number_of_value_below_per_ceil == ideal_number_of_value_below_per_floor:
-            # No need to interpolate, return smallest value of the top per percent values
+    top_per_percent = arr.topk(k = 100 - ideal_number_of_value_below_per_ceil, axis=axis)
+    sample_size_without_nans = get_sample_size_without_nans(arr, axis=axis )[..., np.newaxis]
+    if sample_size_without_nans.sum() == arr.size and ideal_number_of_value_below_per_ceil == ideal_number_of_value_below_per_floor:
+            # No NaNs so every array have the same number of values on axis `axis`.
+            # No need to interpolate, because the virtual index is an actual integer, so it's a true index in the array.
             return top_per_percent[-1]
-        else:
-            result = linear_interpolation(top_per_percent[-1], top_per_percent[-2])
     else:
         # has nans
-        sample_sizes = get_no_nans_sample_sizes()
-        virtual_indexes = _compute_virtual_index(n = sample_sizes, quantiles=quantile, alpha=1/3, beta=1/3)
-        previous_indexes, next_indexes = _get_indexes(
-        arr, virtual_indexes, valid_values_count=ideal_number_of_value_below_per_ceil
-        )
+        virtual_indices = _compute_virtual_index(n = sample_size_without_nans, quantiles=quantile, alpha=alpha, beta=beta)
+        previous_indices = np.floor(virtual_indices)
+        gamma = _get_gamma(virtual_indices, previous_indices)
+        previous_values = np.take(top_per_percent, -1, axis=axis)
+        next_values = np.take(top_per_percent, -2, axis=axis)
+        breakpoint()
+        return _lerp(previous_values, next_values, gamma)
         # Same shape array but for the first axis which is one value (will be filled with the percentile)
-        result = arr[1,...]
-        # TODO: make sure this is performant enough
-        #       There is no take_along_axis on dask so we need an alternative
-        previouses = top_per_percent.ravel()[previous_indexes.ravel()].reshape(previous_indexes)
-        nextes = top_per_percent.ravel()[next_indexes.ravel()].reshape(next_indexes)
+        # if _is_chunked_dask_array(arr):
+        # else:
+        #     previous_values = np.take_along_axis(arr, previous_indices, axis=axis)
+        #     next_values = np.take_along_axis(arr, next_indices, axis=axis)
 
-        for i, (b,a) in enumerate(zip(previous_indexes, next_indexes)):
-            result[i] = linear_interpolation(top_per_percent[i,-b], top_per_percent[i,-a])
+def _is_chunked_dask_array(arr)-> bool:
+    return getattr(arr, "chunk", None) is not None
+
+def take_along_axis_chunk(
+    arr: np.ndarray, indices: np.ndarray, offset: np.ndarray, arr_size: int, axis: int
+):
+    """Slice an ndarray according to ndarray indices along an axis.
+
+    Parameters
+    ----------
+    arr: np.ndarray, dtype=Any
+        The data array.
+    indices: np.ndarray, dtype=int64
+        The indices of interest.
+    offset: np.ndarray, shape=(1, ), dtype=int64
+        Index of the first element along axis of the current chunk of arr
+    arr_size: int
+        Total size of the arr da.Array along axis
+    axis: int
+        The axis along which the indices are from.
+
+    Returns
+    -------
+    out: np.ndarray
+        The indexed arr.
+    """
+    # Needed when indices is unsigned
+    indices = indices.astype(np.int64)
+    # Normalize negative indices
+    indices = np.where(indices < 0, indices + arr_size, indices)
+    # A chunk of the offset dask Array is a numpy array with shape (1, ).
+    # It indicates the index of the first element along axis of the current
+    # chunk of arr.
+    indices = indices - offset
+    # Drop elements of idx that do not fall inside the current chunk of arr.
+    idx_filter = (indices >= 0) & (indices < arr.shape[axis])
+    indices[~idx_filter] = 0
+    res = np.take_along_axis(arr, indices,axis=axis)
+    res[~idx_filter] = 0
+    return np.expand_dims(res, axis)
+
+def dask_take_along_axis(arr: Array, indices: Array, axis: int):
+    """Slice a dask ndarray according to dask ndarray of indices along an axis.
+
+    Parameters
+    ----------
+    arr: dask.array.Array, dtype=Any
+        Data array.
+    indices: dask.array.Array, dtype=int64
+        Indices of interest.
+    axis:int
+        The axis along which the indices are from.
+
+    Returns
+    -------
+    out: dask.array.Array
+        The indexed arr.
+    """
+    from dask.array.core import Array, blockwise, from_array
+
+    if axis < 0:
+        axis += arr.ndim
+    assert 0 <= axis < arr.ndim
+    if np.isnan(arr.chunks[axis]).any():
+        raise NotImplementedError(
+            "take_along_axis for an array with unknown chunks with "
+            "a dask.array of ints is not supported"
+        )
+    # Calculate the offset at which each chunk starts along axis
+    # e.g. chunks=(..., (5, 3, 4), ...) -> offset=[0, 5, 8]
+    offset = np.roll(np.cumsum(arr.chunks[axis]), 1)
+    offset[0] = 0
+    da_offset = from_array(offset, chunks=1)
+    # Tamper with the declared chunks of offset to make blockwise align it with
+    # arr[axis]
+    da_offset = Array(
+        da_offset.dask, da_offset.name, (arr.chunks[axis],), da_offset.dtype
+    )
+    # Define axis labels for blockwise
+    arr_axes = tuple(range(arr.ndim))
+    idx_label = (arr.ndim,)  # arbitrary unused
+    index_axes = arr_axes[:axis] + idx_label + arr_axes[axis + 1 :]
+    offset_axes = (axis,)
+    p_axes = arr_axes[: axis + 1] + idx_label + arr_axes[axis + 1 :]
+    # Compute take_along_axis for each chunk
+    # TODO: Add meta argument for blockwise ?
+    p = blockwise(
+        take_along_axis_chunk,
+        p_axes,
+        arr,
+        arr_axes,
+        indices,
+        index_axes,
+        da_offset,
+        offset_axes,
+        arr_size=arr.shape[axis],
+        axis=axis,
+        dtype=arr.dtype,
+    )
+    res = p.sum(axis=axis)
+    return res
 
 
+def get_sample_size_without_nans(arr: np.ndarray | Array, axis: int) -> ndarray:
+    """
+    Returns
+    -------
+    out: ndarray| dask.Array, shape=arr.shape, dtype=int
+        The number of non-NaN computed on axis `axis`
+    """
+    return (~np.isnan(arr)).sum(axis=axis)
+
+def _get_gamma(virtual_indices: np.ndarray, previous_indices: np.ndarray):
+    """Compute gamma (AKA 'm' or 'weight') for the linear interpolation of quantiles.
+
+    Parameters
+    ----------
+    virtual_indices: array_like
+      The indices where the percentile is supposed to be found in the sorted sample.
+    previous_indices: array_like
+      The floor values of virtual_indices.
+
+    Notes
+    -----
+    `gamma` is usually the fractional part of virtual_indices but can be modified by the interpolation method.
+    """
+    return virtual_indices - previous_indices
+
+def _lerp(a, b, t, out=None):
+    """
+    Compute the linear interpolation weighted by gamma on each point of
+    two same shape array.
+
+    a : array_like
+        Left bound.
+    b : array_like
+        Right bound.
+    t : array_like
+        The interpolation weight.
+    out : array_like
+        Output array.
+    """
+    diff_b_a = b - a
+    # lerp_interpolation = a + diff_b_a * t
+    lerp_interpolation = np.add(a, diff_b_a * t, out=out)
+    np.subtract(b, diff_b_a * (1 - t), out=lerp_interpolation, where=t >= 0.5,
+              dtype=type(lerp_interpolation.dtype))
+    if lerp_interpolation.ndim == 0 and out is None:
+        lerp_interpolation = lerp_interpolation[()]  # unpack 0d arrays
+    return lerp_interpolation
+
+def _get_indices(virtual_indices, valid_values_count):
+    """
+    Get the valid indices of arr neighbouring virtual_indices.
+    Note
+    This is a companion function to linear interpolation of
+    Quantiles
+
+    Returns
+    -------
+    (previous_indices, next_indices): Tuple
+        A Tuple of virtual_indices neighbouring indices
+    """
+    previous_indices = np.floor(virtual_indices).astype(np.intp)
+    next_indices = previous_indices + 1
+    indices_above_bounds = virtual_indices >= valid_values_count - 1
+    # When indices is above max index, take the max value of the array
+    previous_indices[indices_above_bounds] = -1
+    next_indices[indices_above_bounds] = -1
+    # When indices is below min index, take the min value of the array
+    indices_below_bounds = virtual_indices < 0
+    previous_indices[indices_below_bounds] = 0
+    next_indices[indices_below_bounds] = 0
+    return previous_indices, next_indices
 
 def _compute_virtual_index(
     n: np.ndarray, quantiles: np.ndarray | float, alpha: float, beta: float
 ):
-    """Compute the floating point indexes of an array for the linear interpolation of quantiles.
+    """Compute the floating point indices of an array for the linear interpolation of quantiles.
 
     Based on the approach used by :cite:t:`hyndman_sample_1996`.
 
@@ -374,10 +546,6 @@ def _compute_virtual_index(
     :cite:cts:`hyndman_sample_1996`
     """
     return n * quantiles + (alpha + quantiles * (1 - alpha - beta)) - 1
-
-def linear_interpolation(arr1, arr2, alpha: float = 1.0, beta: float = 1.0):
-    pass
-
 
 def nan_topk(a, k, axis, keepdims):
     """Compute topk on a chunk while ignoring nans.
