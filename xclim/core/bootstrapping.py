@@ -233,7 +233,7 @@ def bootstrap_func(
                 beta=per_beta,
                 percentiles=per_per,
                 copy=False,
-                pre_sorted=True
+                # pre_sorted=True
             )
             index_kwargs[per_key] = per_doy
             if summed_exceedance is None:
@@ -304,7 +304,7 @@ def bootstrap_func(
     # result.attrs["units"] = value.attrs["units"]
     return result
 
-def distributed_percentile(arr: Array, per: int, axis:int, alpha: float = 1/3, beta: float=1/3):
+def distributed_percentile(arr: Array, per: float, axis:int, alpha: float = 1/3, beta: float=1/3):
     """
     Parameters
     ----------
@@ -320,32 +320,29 @@ def distributed_percentile(arr: Array, per: int, axis:int, alpha: float = 1/3, b
     # #### Monkey patch end.
     quantile = per/100
     # Ideal because some chunks may have Nan, so the number of values below per will be lower for these chunks.
-    ideal_number_of_value_below_per =  arr.shape[axis] * quantile
-    ideal_number_of_value_below_per_ceil = ceil(ideal_number_of_value_below_per)
-    ideal_number_of_value_below_per_floor = floor(ideal_number_of_value_below_per)
-    top_per_percent = arr.topk(k = 100 - ideal_number_of_value_below_per_ceil, axis=axis)
-    sample_size_without_nans = get_sample_size_without_nans(arr, axis=axis )[..., np.newaxis]
-    if sample_size_without_nans.sum() == arr.size and ideal_number_of_value_below_per_ceil == ideal_number_of_value_below_per_floor:
+    ideal_index = _compute_virtual_index(n = arr.shape[axis], quantiles=quantile, alpha=alpha, beta=beta)
+    ideal_index_ceil = ceil(ideal_index)
+    ideal_index_floor = floor(ideal_index)
+    breakpoint()
+    if per > 50:
+        top_count = arr.shape[axis] - ideal_index_floor
+    else:
+        top_count = ideal_index_ceil * -1
+    top_per_percent = arr.topk(k = top_count, axis=axis)
+    no_nans_sample_size = _get_sample_size_without_nans(arr, axis=axis )[..., np.newaxis]
+    if no_nans_sample_size.sum() == arr.size and ideal_index_ceil == ideal_index_floor:
             # No NaNs so every array have the same number of values on axis `axis`.
             # No need to interpolate, because the virtual index is an actual integer, so it's a true index in the array.
-            return top_per_percent[-1]
+            return np.take(top_per_percent,-1, axis=axis)
     else:
-        # has nans
-        virtual_indices = _compute_virtual_index(n = sample_size_without_nans, quantiles=quantile, alpha=alpha, beta=beta)
+        # has nans or need interpolation
+        virtual_indices = _compute_virtual_index(n = no_nans_sample_size, quantiles=quantile, alpha=alpha, beta=beta)
         previous_indices = np.floor(virtual_indices)
-        gamma = _get_gamma(virtual_indices, previous_indices)
+        gamma = _get_gamma(virtual_indices, previous_indices).squeeze()
+        # TODO (@bzah): Verify the order when k (from topk) is negative and adjust the indices to take.
         previous_values = np.take(top_per_percent, -1, axis=axis)
         next_values = np.take(top_per_percent, -2, axis=axis)
-        breakpoint()
-        return _lerp(previous_values, next_values, gamma)
-        # Same shape array but for the first axis which is one value (will be filled with the percentile)
-        # if _is_chunked_dask_array(arr):
-        # else:
-        #     previous_values = np.take_along_axis(arr, previous_indices, axis=axis)
-        #     next_values = np.take_along_axis(arr, next_indices, axis=axis)
-
-def _is_chunked_dask_array(arr)-> bool:
-    return getattr(arr, "chunk", None) is not None
+        return _linear_interpolation(previous_values, next_values, gamma)
 
 def take_along_axis_chunk(
     arr: np.ndarray, indices: np.ndarray, offset: np.ndarray, arr_size: int, axis: int
@@ -447,7 +444,7 @@ def dask_take_along_axis(arr: Array, indices: Array, axis: int):
     return res
 
 
-def get_sample_size_without_nans(arr: np.ndarray | Array, axis: int) -> ndarray:
+def _get_sample_size_without_nans(arr: np.ndarray | Array, axis: int) -> ndarray:
     """
     Returns
     -------
@@ -472,7 +469,7 @@ def _get_gamma(virtual_indices: np.ndarray, previous_indices: np.ndarray):
     """
     return virtual_indices - previous_indices
 
-def _lerp(a, b, t, out=None):
+def _linear_interpolation(a, b, t, out=None):
     """
     Compute the linear interpolation weighted by gamma on each point of
     two same shape array.
@@ -547,23 +544,26 @@ def _compute_virtual_index(
     """
     return n * quantiles + (alpha + quantiles * (1 - alpha - beta)) - 1
 
-def nan_topk(a, k, axis, keepdims):
+def nan_topk(arr, k, axis, keepdims):
     """Compute topk on a chunk while ignoring nans.
 
     TODO: To upstream to Dask
     """
     assert keepdims is True
     axis = axis[0]
-    if abs(k) >= a.shape[axis]:
-        return a
-    max_nan_count = np.isnan(a).sum(axis=axis).max()
-    if max_nan_count != 0:
-        a = np.partition(a, -(k + max_nan_count), axis=axis)
-        a = a[~np.isnan(a)]
+    if abs(k) >= arr.shape[axis]:
+        return arr
+    max_nan_count = np.isnan(arr).sum(axis=axis).max()
+    if k + max_nan_count > arr.shape[axis]:
+        arr = np.sort(arr, axis=axis)
+        arr = arr[~np.isnan(arr)]
+    elif max_nan_count != 0:
+        arr = np.partition(arr, -(k + max_nan_count), axis=axis)
+        arr = arr[~np.isnan(arr)]
     else:
-        a = np.partition(a, -k, axis=axis)
+        arr = np.partition(arr, -k, axis=axis)
     k_slice = slice(-k, None) if k > 0 else slice(-k)
-    return a[tuple(k_slice if i == axis else slice(None) for i in range(a.ndim))]
+    return arr[tuple(k_slice if i == axis else slice(None) for i in range(arr.ndim))]
 
 def nan_argtopk(a_plus_idx, k, axis, keepdims):
     """Compute argtopk on a chunk while ignoring nans.
@@ -575,24 +575,25 @@ def nan_argtopk(a_plus_idx, k, axis, keepdims):
     axis = axis[0]
     if isinstance(a_plus_idx, list):
         a_plus_idx = list(flatten(a_plus_idx))
-        a = np.concatenate([ai for ai, _ in a_plus_idx], axis)
+        arr = np.concatenate([ai for ai, _ in a_plus_idx], axis)
         idx = np.concatenate(
             [np.broadcast_to(idxi, ai.shape) for ai, idxi in a_plus_idx], axis
         )
     else:
-        a, idx = a_plus_idx
-    if abs(k) >= a.shape[axis]:
+        arr, idx = a_plus_idx
+    if abs(k) >= arr.shape[axis]:
         return a_plus_idx
-    max_nan_count = np.isnan(a).sum(axis=axis).max()
-    if max_nan_count != 0:
-        idx2 = np.argpartition(a, -(k + max_nan_count), axis=axis)
-        mask = np.isnan(a[idx2])
-        idx2 = idx2[~mask]
+    max_nan_count = np.isnan(arr).sum(axis=axis).max()
+    if k + max_nan_count > arr.shape[axis]:
+        arr = np.argsort(arr, axis=axis)
+    elif max_nan_count != 0:
+        idx2 = np.argpartition(arr, -(k + max_nan_count), axis=axis)
+        idx2 = idx2[~np.isnan(arr[idx2])]
     else:
-        idx2 = np.argpartition(a, -k, axis=axis)
+        idx2 = np.argpartition(arr, -k, axis=axis)
     k_slice = slice(-k, None) if k > 0 else slice(-k)
-    idx2 = idx2[tuple(k_slice if i == axis else slice(None) for i in range(a.ndim))]
-    return np.take_along_axis(a, idx2, axis), np.take_along_axis(idx, idx2, axis)
+    idx2 = idx2[tuple(k_slice if i == axis else slice(None) for i in range(arr.ndim))]
+    return np.take_along_axis(arr, idx2, axis), np.take_along_axis(idx, idx2, axis)
 
 
 def _get_bootstrap_freq(freq):
