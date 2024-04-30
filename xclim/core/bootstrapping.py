@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 from inspect import signature
-from math import ceil, floor
+from math import ceil, floor, isnan
 from typing import Any, Callable, Generator
 
 import cftime
@@ -314,6 +314,9 @@ def distributed_percentile(arr: Array, per: float, axis:int, alpha: float = 1/3,
     axis: int
         Axis where the computation is performed.
     """
+    # TODO:
+    # - Make sure distributed_percentile gives exactly the same result as nanpercentile
+    # - Make sure the performances are actually better in the context of percentile_doy
     # #### Monkey patch dask chunk's topk to use our nan handling topk
     import dask
     dask.array.chunk.topk = nan_topk
@@ -323,7 +326,6 @@ def distributed_percentile(arr: Array, per: float, axis:int, alpha: float = 1/3,
     ideal_index = _compute_virtual_index(n = arr.shape[axis], quantiles=quantile, alpha=alpha, beta=beta)
     ideal_index_ceil = ceil(ideal_index)
     ideal_index_floor = floor(ideal_index)
-    breakpoint()
     if per > 50:
         top_count = arr.shape[axis] - ideal_index_floor
     else:
@@ -553,16 +555,43 @@ def nan_topk(arr, k, axis, keepdims):
     axis = axis[0]
     if abs(k) >= arr.shape[axis]:
         return arr
-    max_nan_count = np.isnan(arr).sum(axis=axis).max()
-    if k + max_nan_count > arr.shape[axis]:
-        arr = np.sort(arr, axis=axis)
-        arr = arr[~np.isnan(arr)]
-    elif max_nan_count != 0:
-        arr = np.partition(arr, -(k + max_nan_count), axis=axis)
-        arr = arr[~np.isnan(arr)]
-    else:
-        arr = np.partition(arr, -k, axis=axis)
+    nan_counts = np.isnan(arr).sum(axis=axis)
+    max_nan_count = nan_counts.max()
+    ###
+    # A = [[1,     3,4],
+    #      [2,np.nan,5]]
+    # t = 2
+    # sorted_A =     [[1,3,     4],
+    #                 [2,5,np.NaN]]
+    # arg_sorted_a = [[0,1,2],
+    #                 [0,2,1]]
+    # nan_counts =   [0,1]
+    #
+    # arg_sorted_a[0:nan_counts]
+    # top_indexes =  [[1,2],
+    #                 [0,2]]
+    # top_2 = np.take_along_axis(A, top_indexes, axis=-1)
+    #
+    # # Et si on triche ?
+    # A[np.isnan(A)] = -42
+    # sorted_no_nan_A = np.sort(A, axis=axis)
+    # # sorted_no_nan_A = [[1,3,     4],
+    # #                   [-42, 2, 5]]
+    # top2 = sorted_no_nan_A[:,-2:]
+    ###
+    # if max_nan_count != 0:
+    if np.isnan(arr).any():
+        # Make sure the result is still correct/okay if there are so many nans that
+        # they end up in the top k result.
+        if k > 0:
+            replacing_value = np.nanmin(arr, axis=axis) -1
+        else:
+            replacing_value = np.nanmax(arr, axis=axis) + 1
+        replacing_value = np.expand_dims(replacing_value, axis=axis)
+        replacing_value = np.broadcast_to(replacing_value, arr.shape)
+        arr = np.where(np.isfinite(arr), arr, replacing_value)
     k_slice = slice(-k, None) if k > 0 else slice(-k)
+    arr = np.partition(arr, -k, axis=axis)
     return arr[tuple(k_slice if i == axis else slice(None) for i in range(arr.ndim))]
 
 def nan_argtopk(a_plus_idx, k, axis, keepdims):

@@ -1965,51 +1965,12 @@ def percentile_doy_distributed(
     per: float = 10.0,
     alpha: float = 1.0 / 3.0,
     beta: float = 1.0 / 3.0,
-    copy: bool = True,
 ) -> xr.DataArray:
-    """Percentile value for each day of the year.
-
-    Return the climatological percentile over a moving window around each day of the year. Different quantile estimators
-    can be used by specifying `alpha` and `beta` according to specifications given by :cite:t:`hyndman_sample_1996`.
-    The default definition corresponds to method 8, which meets multiple desirable statistical properties for sample
-    quantiles. Note that `numpy.percentile` corresponds to method 7, with alpha and beta set to 1.
-
-    Parameters
-    ----------
-    arr : xr.DataArray
-      Input data, a daily frequency (or coarser) is required.
-    window : int
-      Number of time-steps around each day of the year to include in the calculation.
-    per : float or sequence of floats
-      Percentile(s) between [0, 100]
-    alpha : float
-        Plotting position parameter.
-    beta : float
-        Plotting position parameter.
-    copy : bool
-        If True (default) the input array will be deep-copied. It's a necessary step
-        to keep the data integrity, but it can be costly.
-        If False, no copy is made of the input array. It will be mutated and rendered
-        unusable but performances may significantly improve.
-        Put this flag to False only if you understand the consequences.
-
-    Returns
-    -------
-    xr.DataArray
-        The percentiles indexed by the day of the year.
-        For calendars with 366 days, percentiles of doys 1-365 are interpolated to the 1-366 range.
-
-    References
-    ----------
-    :cite:cts:`hyndman_sample_1996`
-    """
     # Ensure arr sampling frequency is daily or coarser
     # but cowardly escape the non-inferrable case.
     if compare_offsets(xr.infer_freq(arr.time) or "D", "<", "D"):
         raise ValueError("input data should have daily or coarser frequency")
-
     rr = arr.rolling(min_periods=1, center=True, time=window).construct("window")
-
     crd = xr.Coordinates.from_pandas_multiindex(
         pd.MultiIndex.from_arrays(
             (rr.time.dt.year.values, rr.time.dt.dayofyear.values),
@@ -2019,9 +1980,7 @@ def percentile_doy_distributed(
     )
     rr = rr.drop_vars("time").assign_coords(crd)
     rrr = rr.unstack("time").stack(stack_dim=("year", "window"))
-
     from xclim.core.bootstrapping import distributed_percentile
-
-    p = distributed_percentile(rrr.data, per=per, axis=0, alpha=alpha, beta=beta)
+    p = distributed_percentile(rrr.data, per=per, axis=rrr.get_axis_num("stack_dim"), alpha=alpha, beta=beta)
     return p
 
