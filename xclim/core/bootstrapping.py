@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from inspect import signature
+from logging import debug
 from math import ceil, floor, isnan
 from typing import Any, Callable, Generator
 
@@ -334,17 +335,18 @@ def distributed_percentile(arr: Array, per: float, axis:int, alpha: float = 1/3,
     no_nans_sample_size = _get_sample_size_without_nans(arr, axis=axis )[..., np.newaxis]
     if no_nans_sample_size.sum() == arr.size and ideal_index_ceil == ideal_index_floor:
             # No NaNs so every array have the same number of values on axis `axis`.
-            # No need to interpolate, because the virtual index is an actual integer, so it's a true index in the array.
-            return np.take(top_per_percent,-1, axis=axis)
+            # No need to interpolate, because the virtual index is an integer, so it's a true index in the array.
+            return np.take(top_per_percent,0, axis=axis)
     else:
         # has nans or need interpolation
         virtual_indices = _compute_virtual_index(n = no_nans_sample_size, quantiles=quantile, alpha=alpha, beta=beta)
         previous_indices = np.floor(virtual_indices)
+        indices_in_top = no_nans_sample_size - 1 - previous_indices
         gamma = _get_gamma(virtual_indices, previous_indices).squeeze()
         # TODO (@bzah): Verify the order when k (from topk) is negative and adjust the indices to take.
-        previous_values = np.take(top_per_percent, -1, axis=axis)
-        next_values = np.take(top_per_percent, -2, axis=axis)
-        return _linear_interpolation(previous_values, next_values, gamma)
+        previous_values = dask_take_along_axis(top_per_percent, indices_in_top, axis=axis)
+        next_values = dask_take_along_axis(top_per_percent, indices_in_top -1, axis=axis)
+        return _linear_interpolation(previous_values, next_values, gamma[...,np.newaxis])
 
 def take_along_axis_chunk(
     arr: np.ndarray, indices: np.ndarray, offset: np.ndarray, arr_size: int, axis: int
@@ -541,7 +543,6 @@ def _compute_virtual_index(
     `alpha` and `beta` values depend on the chosen method (see quantile documentation).
 
     References
-    ----------
     :cite:cts:`hyndman_sample_1996`
     """
     return n * quantiles + (alpha + quantiles * (1 - alpha - beta)) - 1
@@ -555,44 +556,30 @@ def nan_topk(arr, k, axis, keepdims):
     axis = axis[0]
     if abs(k) >= arr.shape[axis]:
         return arr
-    nan_counts = np.isnan(arr).sum(axis=axis)
-    max_nan_count = nan_counts.max()
-    ###
-    # A = [[1,     3,4],
-    #      [2,np.nan,5]]
-    # t = 2
-    # sorted_A =     [[1,3,     4],
-    #                 [2,5,np.NaN]]
-    # arg_sorted_a = [[0,1,2],
-    #                 [0,2,1]]
-    # nan_counts =   [0,1]
-    #
-    # arg_sorted_a[0:nan_counts]
-    # top_indexes =  [[1,2],
-    #                 [0,2]]
-    # top_2 = np.take_along_axis(A, top_indexes, axis=-1)
-    #
-    # # Et si on triche ?
-    # A[np.isnan(A)] = -42
-    # sorted_no_nan_A = np.sort(A, axis=axis)
-    # # sorted_no_nan_A = [[1,3,     4],
-    # #                   [-42, 2, 5]]
-    # top2 = sorted_no_nan_A[:,-2:]
-    ###
-    # if max_nan_count != 0:
-    if np.isnan(arr).any():
-        # Make sure the result is still correct/okay if there are so many nans that
-        # they end up in the top k result.
+    nan_mask = np.isnan(arr)
+    replacing_value = None
+    if nan_mask.any():
         if k > 0:
-            replacing_value = np.nanmin(arr, axis=axis) -1
+            replacing_value = _get_min_value(arr.dtype)
         else:
-            replacing_value = np.nanmax(arr, axis=axis) + 1
-        replacing_value = np.expand_dims(replacing_value, axis=axis)
-        replacing_value = np.broadcast_to(replacing_value, arr.shape)
-        arr = np.where(np.isfinite(arr), arr, replacing_value)
+            replacing_value = _get_max_value(arr.dtype)
+        arr[nan_mask] = replacing_value
     k_slice = slice(-k, None) if k > 0 else slice(-k)
-    arr = np.partition(arr, -k, axis=axis)
-    return arr[tuple(k_slice if i == axis else slice(None) for i in range(arr.ndim))]
+    partitioned_arr = np.partition(arr, -k, axis=axis)
+    slices = list(slice(None) for _ in range(arr.ndim))
+    slices[axis] = k_slice
+    topk = partitioned_arr[tuple(slices)]
+    if nan_mask.any():
+        topk[topk==replacing_value] = np.nan
+        # reset arr to initial state, todo: is it necessary ? can we mutate arr without reseting it instead ?
+        arr[nan_mask] = np.nan
+    return topk
+
+def _get_min_value(dtype: np.dtype)-> np.number :
+    return np.finfo(dtype).min
+
+def _get_max_value(dtype: np.dtype)-> np.number :
+    return np.finfo(dtype).max
 
 def nan_argtopk(a_plus_idx, k, axis, keepdims):
     """Compute argtopk on a chunk while ignoring nans.

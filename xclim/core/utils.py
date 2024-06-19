@@ -398,7 +398,7 @@ def _get_gamma(virtual_indexes: np.ndarray, previous_indexes: np.ndarray):
     return np.asanyarray(gamma)
 
 
-def _get_indexes(
+def _get_indices(
     arr: np.ndarray, virtual_indexes: np.ndarray, valid_values_count: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
     """Get the valid indexes of arr neighbouring virtual_indexes.
@@ -510,25 +510,25 @@ def _nan_quantile(
     # --- Computation of indexes
     # Add axis for quantiles
     valid_values_count = valid_values_count[..., np.newaxis]
-    virtual_indexes = _compute_virtual_index(valid_values_count, quantiles, alpha, beta)
-    virtual_indexes = np.asanyarray(virtual_indexes)
-    previous_indexes, next_indexes = _get_indexes(
-        arr, virtual_indexes, valid_values_count
+    virtual_indices = _compute_virtual_index(valid_values_count, quantiles, alpha, beta)
+    virtual_indices = np.asanyarray(virtual_indices)
+    previous_indices, next_indices = _get_indices(
+        arr, virtual_indices, valid_values_count
     )
     # --- Sorting
     arr.sort(axis=DATA_AXIS)
     # --- Get values from indexes
     arr = arr[..., np.newaxis]
     previous_elements = np.squeeze(
-        np.take_along_axis(arr, previous_indexes.astype(int)[np.newaxis, ...], axis=0),
+        np.take_along_axis(arr, previous_indices.astype(int)[np.newaxis, ...], axis=0),
         axis=0,
     )
     next_elements = np.squeeze(
-        np.take_along_axis(arr, next_indexes.astype(int)[np.newaxis, ...], axis=0),
+        np.take_along_axis(arr, next_indices.astype(int)[np.newaxis, ...], axis=0),
         axis=0,
     )
     # --- Linear interpolation
-    gamma = _get_gamma(virtual_indexes, previous_indexes)
+    gamma = _get_gamma(virtual_indices, previous_indices)
     interpolation = _linear_interpolation(previous_elements, next_elements, gamma)
     # When an interpolation is in Nan range, (near the end of the sorted array) it means
     # we can clip to the array max value.

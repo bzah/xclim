@@ -9,6 +9,7 @@ import pytest
 import xarray as xr
 from numpy.testing import assert_array_equal
 from xarray.coding.cftimeindex import CFTimeIndex
+from xclim.core.bootstrapping import nan_topk
 
 from xclim.core.calendar import (
     adjust_doy_calendar,
@@ -743,3 +744,22 @@ def test_stack_periods_special(tas_series):
 
     da2 = unstack_periods(da_stck.drop_vars("horizon_length"), dim="horizon")
     xr.testing.assert_identical(da2, da.isel(time=slice(0, da2.time.size)))
+
+def test_nan_topk__no_nans():
+    input = [2, 2, 1, 3, 5]
+    expected_out = [3,5]
+    out = nan_topk(input, k=2, axis=-1, keepdims=True)
+    assert out == expected_out
+
+def test_nan_topk__few_nans():
+    input = [2, np.nan, np.nan, 3, 5]
+    expected_out = [3,5]
+    out = nan_topk(input, k=2, axis=-1, keepdims=True)
+    assert out == expected_out
+
+def test_nan_topk__many_nans():
+    input = [np.nan, np.nan, np.nan, np.nan, 5]
+    expected_out = [np.nan,5]
+    out = nan_topk(input, k=2, axis=-1, keepdims=True)
+    assert out == expected_out
+
