@@ -332,21 +332,27 @@ def distributed_percentile(arr: Array, per: float, axis:int, alpha: float = 1/3,
     else:
         top_count = ideal_index_ceil * -1
     top_per_percent = arr.topk(k = top_count, axis=axis)
-    no_nans_sample_size = _get_sample_size_without_nans(arr, axis=axis )[..., np.newaxis]
-    if no_nans_sample_size.sum() == arr.size and ideal_index_ceil == ideal_index_floor:
-            # No NaNs so every array have the same number of values on axis `axis`.
-            # No need to interpolate, because the virtual index is an integer, so it's a true index in the array.
-            return np.take(top_per_percent,0, axis=axis)
-    else:
-        # has nans or need interpolation
-        virtual_indices = _compute_virtual_index(n = no_nans_sample_size, quantiles=quantile, alpha=alpha, beta=beta)
-        previous_indices = np.floor(virtual_indices)
-        indices_in_top = no_nans_sample_size - 1 - previous_indices
-        gamma = _get_gamma(virtual_indices, previous_indices).squeeze()
-        # TODO (@bzah): Verify the order when k (from topk) is negative and adjust the indices to take.
-        previous_values = dask_take_along_axis(top_per_percent, indices_in_top, axis=axis)
-        next_values = dask_take_along_axis(top_per_percent, indices_in_top -1, axis=axis)
-        return _linear_interpolation(previous_values, next_values, gamma[...,np.newaxis])
+    no_nans_sample_size = _get_sample_size_without_nans(arr, axis=axis )
+    no_nans_sample_size = np.expand_dims(no_nans_sample_size, axis=axis)
+    # TODO (@abel): Make sure it's a good idea to **not** implement the shorter path for when interpolation is needed.
+    #               The reasoning for not implementing it is: whenever dask encounter a `if` based on the data itself,
+    #               it needs to compute the data to be able to compute the graph of task.
+    #               Hence, it triggers a halfway computation that reduce the overall performance of the algorithm.
+    # if no_nans_sample_size.sum() == arr.size and ideal_index_ceil == ideal_index_floor:
+    #         # No NaNs so every array have the same number of values on axis `axis`.
+    #         # No need to interpolate, because the virtual index is an integer, so it's a true index in the array.
+    #         return np.take(top_per_percent,0, axis=axis)
+    # else:
+    #     # has nans or need interpolation
+    virtual_indices = _compute_virtual_index(n = no_nans_sample_size, quantiles=quantile, alpha=alpha, beta=beta)
+    previous_indices = np.floor(virtual_indices)
+    indices_in_top = no_nans_sample_size - 1 - previous_indices
+    gamma = _get_gamma(virtual_indices, previous_indices).squeeze()
+    gamma = np.expand_dims(gamma, axis=axis)
+    # TODO (@bzah): Verify the order when k (from topk) is negative and adjust the indices to take.
+    previous_values = dask_take_along_axis(top_per_percent, indices_in_top, axis=axis)
+    next_values = dask_take_along_axis(top_per_percent, indices_in_top -1, axis=axis)
+    return _linear_interpolation(previous_values, next_values, gamma)
 
 def take_along_axis_chunk(
     arr: np.ndarray, indices: np.ndarray, offset: np.ndarray, arr_size: int, axis: int

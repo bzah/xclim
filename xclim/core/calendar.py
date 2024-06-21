@@ -1980,6 +1980,12 @@ def percentile_doy_distributed(
     )
     rr = rr.drop_vars("time").assign_coords(crd)
     rrr = rr.unstack("time").stack(stack_dim=("year", "window"))
+    if rrr.chunks is not None and len(rrr.chunks[rrr.get_axis_num("stack_dim")]) > 1:
+        # Preserve chunk size
+        time_chunks_count = len(arr.chunks[arr.get_axis_num("time")])
+        doy_chunk_size = np.ceil(len(rrr.dayofyear) / (window * time_chunks_count))
+        rrr = rrr.chunk(dict(stack_dim=-1, dayofyear=doy_chunk_size))
+    breakpoint()
     from xclim.core.bootstrapping import distributed_percentile
     p = distributed_percentile(rrr.data, per=per, axis=rrr.get_axis_num("stack_dim"), alpha=alpha, beta=beta)
     return p
