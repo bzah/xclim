@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import cftime
+import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
@@ -20,7 +21,7 @@ from xarray.coding.cftimeindex import CFTimeIndex
 from xarray.core import dtypes
 from xarray.core.resample import DataArrayResample, DatasetResample
 
-from xclim.core.utils import DayOfYearStr, uses_dask
+from xclim.core.utils import DayOfYearStr, calc_perc, nan_calc_percentiles, uses_dask
 
 from .formatting import update_xclim_history
 
@@ -1955,9 +1956,6 @@ def unstack_periods(da: xr.DataArray | xr.Dataset, dim: str = "period"):
 
     return xr.concat(periods, "time")
 
-
-
-# DO NOT COMMIT BELOW, ONLY FOR TESTING
 # @update_xclim_history
 def percentile_doy_distributed(
     arr: xr.DataArray,
@@ -1985,8 +1983,44 @@ def percentile_doy_distributed(
         time_chunks_count = len(arr.chunks[arr.get_axis_num("time")])
         doy_chunk_size = np.ceil(len(rrr.dayofyear) / (window * time_chunks_count))
         rrr = rrr.chunk(dict(stack_dim=-1, dayofyear=doy_chunk_size))
-    breakpoint()
     from xclim.core.bootstrapping import distributed_percentile
     p = distributed_percentile(rrr.data, per=per, axis=rrr.get_axis_num("stack_dim"), alpha=alpha, beta=beta)
     return p
+
+def percentile_doy_3(
+    arr: xr.DataArray,
+    window: int = 5,
+    per: float = 10.0,
+    alpha: float = 1.0 / 3.0,
+    beta: float = 1.0 / 3.0,
+) -> xr.DataArray:
+    # Attempt without building window
+    # result: bad idea, it creates 7 times more tasks and consumes as much memory as classic percentile_doy
+    result = []
+    from xclim.core.bootstrapping import distributed_percentile
+    for doy in range(1, 366):
+        values_for_per_doy_list = []
+        for windowed_day in range(int(doy-window/2), int(doy+window/2)): # todo: faire modulo 365 et "clip" les negatifs en 365, 364...
+            values_for_per_doy_list.append(arr[arr.time.dt.dayofyear == windowed_day])
+        values_for_per_doy = xr.concat(values_for_per_doy_list, dim="time")
+        doy_axis = values_for_per_doy.get_axis_num("time")
+        p = distributed_percentile(values_for_per_doy.data,
+                                   per=per,
+                                   axis=doy_axis,
+                                   alpha=alpha,
+                                   beta=beta)
+        # p = xr.apply_ufunc(
+        #     calc_perc,
+        #     values_for_per_doy,
+        #     input_core_dims=[["windowed_doy"]],
+        #     output_core_dims=[["percentiles"]],
+        #     keep_attrs=True,
+        #     kwargs=dict(percentiles=per, alpha=alpha, beta=beta, copy=False),
+        #     dask="parallelized",
+        #     output_dtypes=[arr.dtype],
+        #     dask_gufunc_kwargs=dict(output_sizes={"percentiles": len([per])}),
+        # )
+        # doy_result = nan_calc_percentiles(values_for_per_doy.values, percentiles=[per], axis=doy_axis, copy=False)
+        result.append(p)
+    return dask.array.concatenate(result[3:])
 
