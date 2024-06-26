@@ -1956,7 +1956,7 @@ def unstack_periods(da: xr.DataArray | xr.Dataset, dim: str = "period"):
 
     return xr.concat(periods, "time")
 
-# @update_xclim_history
+@update_xclim_history
 def percentile_doy_distributed(
     arr: xr.DataArray,
     window: int = 5,
@@ -1985,7 +1985,23 @@ def percentile_doy_distributed(
         rrr = rrr.chunk(dict(stack_dim=-1, dayofyear=doy_chunk_size))
     from xclim.core.bootstrapping import distributed_percentile
     p = distributed_percentile(rrr.data, per=per, axis=rrr.get_axis_num("stack_dim"), alpha=alpha, beta=beta)
-    return p
+    dims = list(d for d in rrr.dims if d != "stack_dim")
+    dims.append("percentiles")
+    coords = {k:v for k,v in rrr.coords.items() if k not in [ "stack_dim", "window", "year"]}
+    coords["percentiles"]=xr.DataArray([per], dims=("percentiles",))
+    result = xr.DataArray(p, dims=dims, coords=coords, attrs=rrr.attrs, name="percentiles")
+    # The percentile for the 366th day has a sample size of 1/4 of the other days.
+    # To have the same sample size, we interpolate the percentile from 1-365 doy range to 1-366
+    if result.dayofyear.max() == 366:
+        result = adjust_doy_calendar(result.sel(dayofyear=(result.dayofyear < 366)), arr)
+
+    result.attrs.update(arr.attrs.copy())
+    # Saving percentile attributes
+    result.attrs["climatology_bounds"] = build_climatology_bounds(arr)
+    result.attrs["window"] = window
+    result.attrs["alpha"] = alpha
+    result.attrs["beta"] = beta
+    return result
 
 def percentile_doy_3(
     arr: xr.DataArray,
